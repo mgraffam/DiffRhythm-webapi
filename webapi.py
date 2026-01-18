@@ -1,19 +1,3 @@
-# Copyright (c) 2025 ASLP-LAB
-#               2025 Huakang Chen  (huakang@mail.nwpu.edu.cn)
-#               2025 Guobin Ma     (guobin.ma@gmail.com)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import cgi
 import json
 import os
@@ -46,20 +30,25 @@ from infer_utils import (
 
 PORT = 8000
 DEFAULT_OUTPUT_DIR = "infer/example/output"
+MAX_FRAMES = 6144  # supports up to ~285 seconds
 
-# Choose the model size you want to support
-# 2048  → exactly 95 seconds
-# 6144  → up to ~285 seconds (recommended for flexibility)
-MAX_FRAMES = 6144
-
-# Only one generation runs at a time
+# Only one generation at a time
 inference_lock = threading.Lock()
 
+# Current job state (shared across threads - simple & safe for single job)
+current_job_state = {
+    "active": False,
+    "job_id": None,
+    "start_time": None,
+    "params": None,
+    "output_filename": None,
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
-# LOAD MODELS AT STARTUP (eager loading)
+# LOAD MODELS AT STARTUP
 # ──────────────────────────────────────────────────────────────────────────────
 
-print(f"\nStarting model loading (max_frames={MAX_FRAMES})...")
+print(f"\nLoading models (max_frames={MAX_FRAMES})...")
 load_start = time.time()
 
 device = 'cpu'
@@ -72,10 +61,10 @@ print(f"Using device: {device}")
 
 cfm, tokenizer, muq, vae = prepare_model(MAX_FRAMES, device)
 
-print(f"Models loaded successfully in {time.time() - load_start:.2f} seconds\n")
+print(f"Models loaded in {time.time() - load_start:.2f} seconds\n")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# INFERENCE FUNCTION (same as original)
+# CORE INFERENCE FUNCTION
 # ──────────────────────────────────────────────────────────────────────────────
 
 def inference(
@@ -90,7 +79,7 @@ def inference(
     pred_frames,
     batch_infer_num,
     song_duration,
-    chunked=True,
+    chunked=False,
 ):
     with torch.inference_mode():
         latents, _ = cfm_model.sample(
@@ -112,10 +101,9 @@ def inference(
         print(f"Generated {len(latents)} latent(s)")
         for latent in latents:
             latent = latent.to(torch.float32)
-            latent = latent.transpose(1, 2)  # [b d t]
+            latent = latent.transpose(1, 2)
 
             output = decode_audio(latent, vae_model, chunked=chunked)
-
             output = rearrange(output, "b d n -> d (b n)")
             output = (
                 output.to(torch.float32)
@@ -131,17 +119,21 @@ def inference(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# BACKGROUND INFERENCE TASK
+# BACKGROUND GENERATION TASK
 # ──────────────────────────────────────────────────────────────────────────────
 
-def inference_task(params, output_path):
-    """Runs in background thread - long running generation"""
+def inference_task(params, output_path, job_id):
+    global current_job_state
     try:
-        audio_length = params['audio_length']
+        current_job_state.update({
+            "active": True,
+            "job_id": job_id,
+            "start_time": time.time(),
+            "params": params,
+            "output_filename": os.path.basename(output_path),
+        })
 
-        # Optional warning if requested length exceeds loaded model capability
-        if audio_length > 95 and MAX_FRAMES == 2048:
-            print("Warning: Requested length > 95s but server was loaded with small model (2048 frames)")
+        audio_length = params['audio_length']
 
         lrc = params['lrc']
         ref_prompt = params.get('ref_prompt')
@@ -156,10 +148,11 @@ def inference_task(params, output_path):
             MAX_FRAMES, lrc, tokenizer, audio_length, device
         )
 
-        if ref_audio_path:
-            style_prompt = get_style_prompt(muq, ref_audio_path)
-        else:
-            style_prompt = get_style_prompt(muq, prompt=ref_prompt)
+        style_prompt = (
+            get_style_prompt(muq, ref_audio_path)
+            if ref_audio_path else
+            get_style_prompt(muq, prompt=ref_prompt)
+        )
 
         negative_style_prompt = get_negative_style_prompt(device)
 
@@ -185,35 +178,40 @@ def inference_task(params, output_path):
             song_duration=song_duration
         )
 
-        e_t = time.time() - s_t
-        print(f"Inference completed in {e_t:.2f} seconds")
+        print(f"Inference completed in {time.time() - s_t:.2f} seconds")
 
         generated_song = random.sample(generated_songs, 1)[0]
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         torchaudio.save(output_path, generated_song, sample_rate=44100)
-        print(f"File saved successfully: {output_path}")
+        print(f"Saved: {output_path}")
 
     except Exception as e:
-        print(f"Error during inference: {e}")
+        print(f"Inference error: {e}")
     finally:
-        # Cleanup temporary reference audio file if it exists
         if params.get('ref_audio_path') and os.path.exists(params['ref_audio_path']):
             try:
                 os.remove(params['ref_audio_path'])
             except:
                 pass
 
-        # Very important: release the global lock
+        # Reset state
+        current_job_state.update({
+            "active": False,
+            "job_id": None,
+            "start_time": None,
+            "params": None,
+            "output_filename": None,
+        })
+
         inference_lock.release()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP SERVER
+# HTTP HANDLER
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Multi-threaded server - handles concurrent GET requests"""
     daemon_threads = True
 
 
@@ -224,18 +222,17 @@ class InferenceHandler(BaseHTTPRequestHandler):
             self.send_error(404, 'Not Found')
             return
 
-        # Try to acquire lock (non-blocking)
         if not inference_lock.acquire(blocking=False):
-            self.send_response(503)  # Service Unavailable
+            self.send_response(503)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({
-                "error": "Server is busy processing another generation. Please try again later."
+                "error": "Server is busy with another generation"
             }).encode('utf-8'))
             return
 
         try:
-            ctype, pdict = cgi.parse_header(self.headers.get('Content-Type', ''))
+            ctype, _ = cgi.parse_header(self.headers.get('Content-Type', ''))
             if ctype != 'multipart/form-data':
                 raise ValueError("Content-Type must be multipart/form-data")
 
@@ -246,7 +243,6 @@ class InferenceHandler(BaseHTTPRequestHandler):
                          'CONTENT_TYPE': self.headers['Content-Type']}
             )
 
-            # Extract all parameters
             params = {
                 'lrc': form.getvalue('lrc', ''),
                 'ref_prompt': form.getvalue('ref_prompt'),
@@ -259,86 +255,159 @@ class InferenceHandler(BaseHTTPRequestHandler):
                 'batch_infer_num': int(form.getvalue('batch_infer_num', '1')),
             }
 
-            # Handle optional uploaded reference audio
             ref_audio_path = None
             if 'ref_audio' in form and form['ref_audio'].filename:
-                ref_audio_data = form['ref_audio'].file.read()
-                fd, ref_audio_path = tempfile.mkstemp(suffix='.wav')
+                data = form['ref_audio'].file.read()
+                fd, path = tempfile.mkstemp(suffix='.wav')
                 with os.fdopen(fd, 'wb') as f:
-                    f.write(ref_audio_data)
-                params['ref_audio_path'] = ref_audio_path
+                    f.write(data)
+                params['ref_audio_path'] = path
 
-            # Basic validation
             if not (params['ref_prompt'] or params.get('ref_audio_path')):
-                raise ValueError("Either 'ref_prompt' or 'ref_audio' file is required")
+                raise ValueError("ref_prompt or ref_audio required")
             if params['ref_prompt'] and params.get('ref_audio_path'):
-                raise ValueError("Provide only one of 'ref_prompt' or 'ref_audio'")
+                raise ValueError("Only one of ref_prompt or ref_audio allowed")
             if params['edit'] and not (params.get('ref_song') and params.get('edit_segments')):
-                raise ValueError("'ref_song' and 'edit_segments' are required in edit mode")
+                raise ValueError("edit mode requires ref_song and edit_segments")
 
-            # Create unique output filename
+            job_id = uuid.uuid4().hex
             file_id = uuid.uuid4().hex
-            output_filename = f"{file_id}.wav"
-            output_path = os.path.join(params['output_dir'], output_filename)
-            url = f"/output/{output_filename}"
+            filename = f"{file_id}.wav"
+            output_path = os.path.join(params['output_dir'], filename)
+            url = f"/output/{filename}"
 
-            # Immediate response: generation accepted
             self.send_response(202)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({
                 "status": "accepted",
                 "url": url,
-                "message": "Generation started. Check the URL later for the result."
+                "job_id": job_id,
+                "message": "Generation started"
             }).encode('utf-8'))
 
-            # Start background generation
-            thread = threading.Thread(
+            threading.Thread(
                 target=inference_task,
-                args=(params, output_path),
+                args=(params, output_path, job_id),
                 daemon=True
-            )
-            thread.start()
+            ).start()
 
         except Exception as e:
             inference_lock.release()
             self.send_error(400, f"Bad Request: {str(e)}")
 
     def do_GET(self):
-        if self.path.startswith('/output/'):
-            # Note: we use the default output dir here
-            # If you allow custom output_dirs per request, you'd need a mapping system
-            filename = self.path[len('/output/'):]
-            full_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
-
-            if os.path.isfile(full_path):
-                self.send_response(200)
-                self.send_header('Content-Type', 'audio/wav')
-                self.send_header('Content-Length', str(os.path.getsize(full_path)))
-                self.send_header('Cache-Control', 'public, max-age=86400')
-                self.end_headers()
-                with open(full_path, 'rb') as f:
-                    self.wfile.write(f.read())
-            else:
-                self.send_response(404)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    "status": "not_ready",
-                    "message": "The requested file has not been generated yet or does not exist."
-                }).encode('utf-8'))
+        if self.path == '/status':
+            self._send_status()
+        elif self.path == '/files':
+            self._send_files_list()
+        elif self.path.startswith('/output/'):
+            self._send_output_file()
         else:
             self.send_error(404, 'Not Found')
+
+    def _send_status(self):
+        global current_job_state
+        if current_job_state["active"]:
+            elapsed = time.time() - current_job_state["start_time"]
+            data = {
+                "status": "processing",
+                "job_id": current_job_state["job_id"],
+                "elapsed_seconds": round(elapsed, 1),
+                "filename": current_job_state["output_filename"],
+                "params_summary": {
+                    "audio_length": current_job_state["params"].get("audio_length"),
+                    "edit": current_job_state["params"].get("edit", False),
+                    "batch": current_job_state["params"].get("batch_infer_num", 1),
+                }
+            }
+        else:
+            data = {
+                "status": "idle",
+                "message": "No active generation"
+            }
+
+        json_data = json.dumps(data, indent=2)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        self.wfile.write(json_data.encode('utf-8'))
+
+    def _send_files_list(self):
+        try:
+            wav_files = [
+                f for f in os.listdir(DEFAULT_OUTPUT_DIR)
+                if f.lower().endswith('.wav')
+            ]
+            wav_files.sort(key=lambda x: os.path.getmtime(
+                os.path.join(DEFAULT_OUTPUT_DIR, x)), reverse=True)
+
+            data = {
+                "available_files": wav_files,
+                "count": len(wav_files),
+                "download_prefix": "/output/",
+                "current_job": None
+            }
+
+            if current_job_state["active"]:
+                elapsed = time.time() - current_job_state["start_time"]
+                data["current_job"] = {
+                    "status": "processing",
+                    "job_id": current_job_state["job_id"],
+                    "filename": current_job_state["output_filename"],
+                    "elapsed_seconds": round(elapsed, 1)
+                }
+
+            json_data = json.dumps(data, indent=2)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json_data.encode('utf-8'))
+
+        except Exception as e:
+            self.send_error(500, f"Error listing files: {str(e)}")
+
+    def _send_output_file(self):
+        filename = self.path[len('/output/'):]
+        full_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
+
+        if os.path.isfile(full_path):
+            self.send_response(200)
+            self.send_header('Content-Type', 'audio/wav')
+            self.send_header('Content-Length', str(os.path.getsize(full_path)))
+            self.send_header('Cache-Control', 'public, max-age=86400')
+            self.end_headers()
+            with open(full_path, 'rb') as f:
+                self.wfile.write(f.read())
+        else:
+            # Only return status if this is the file currently being generated
+            if (current_job_state["active"] and
+                current_job_state["output_filename"] == filename):
+                elapsed = time.time() - current_job_state["start_time"]
+                data = {
+                    "status": "processing",
+                    "job_id": current_job_state["job_id"],
+                    "elapsed_seconds": round(elapsed, 1),
+                    "message": "File is being generated"
+                }
+                json_data = json.dumps(data)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json_data.encode('utf-8'))
+            else:
+                self.send_error(404, "File not found")
 
 
 if __name__ == "__main__":
     server_address = ('', PORT)
     httpd = ThreadedHTTPServer(server_address, InferenceHandler)
-    print(f"Starting threaded HTTP server on http://localhost:{PORT} ...")
-    print("Only one generation allowed at a time.")
-    print("Models are already loaded and ready.")
+    print(f"Server running on http://localhost:{PORT}")
+    print("Endpoints: /generate (POST), /status, /files, /output/<filename>.wav")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down server...")
+        print("\nShutting down...")
         httpd.server_close()
+
